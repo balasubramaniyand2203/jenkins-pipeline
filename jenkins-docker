@@ -1,0 +1,274 @@
+pipeline {
+    agent any
+    environment {
+        IMAGE_NAME = 'iconnectdev-ui'
+        BUILD_NUMBER = "${env.BUILD_NUMBER}"
+        REPO_URL = 'git@pexgit.growipx.com:in-house/iconnect-ui.git'
+        REPO_URL_ARGO = 'git@pexgit.growipx.com:k8s/argocd/iconnect-dev.git'
+        PROJECT_ID = '1067'
+        SOURCE_BRANCH = 'jenkins-dev'
+        TARGET_BRANCH = 'main'
+        TITLE = 'merge request'
+        GSPACE_ID = 'AAQABwUtXdY'
+        ASSIGNEE_ID = '358'
+    }
+
+    stages {
+        stage('Clone Repository') {
+            steps {
+                script {
+                    try {
+                        checkout([$class: 'GitSCM', branches: [[name: 'develop']], userRemoteConfigs: [[url: REPO_URL]]])
+                        echo "Repository cloned successfully."
+                    } catch (Exception e) {
+                        error "Failed to clone repository: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        stage('Docker Version Check') {
+            steps {
+                script {
+                    try {
+                        sh 'docker --version'
+                        echo "Docker version checked successfully."
+                    } catch (Exception e) {
+                        error "Failed to check Docker version: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        stage('Retrieve Environment File') {
+            steps {
+                withCredentials([file(credentialsId: 'dev-env', variable: 'ENV_FILE')]) {
+                    script {
+                        // Set the correct permissions on the workspace first
+                        sh "chmod -R 755 ${WORKSPACE}"
+                        // Now copy the environment file
+                        sh "cp \$ENV_FILE ${WORKSPACE}/env"
+                        // Ensure the env file has the right permissions
+                        sh "chmod 644 ${WORKSPACE}/env"
+                        echo "Environment file copied successfully."
+                    }
+                }
+            }
+        }
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    try {
+                        sh "docker build --build-arg ENV_FILE=env -f dev-dockerfile -t ${IMAGE_NAME}:${BUILD_NUMBER} --no-cache ."
+                        echo "Docker image built successfully."
+                    } catch (Exception e) {
+                        error "Failed to build Docker image: ${e.getMessage()}"
+                        throw e
+                    }
+                }
+            }
+        }
+        stage('Docker Image - Login') {
+            steps {
+                script {
+                    try {
+                        withCredentials([
+                            usernamePassword(credentialsId: 'git-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS'),
+                            string(credentialsId: 'docker-registry-url', variable: 'DOCKER_REGISTRY_URL') // Assuming you created this credential
+                        ]) {
+                            sh """
+                                echo "Logging into Docker registry: ${DOCKER_REGISTRY_URL}"
+                                docker login "$DOCKER_REGISTRY_URL" -u "$DOCKER_USER" -p "$DOCKER_PASS"
+                            """
+                            echo "Logged into Docker registry successfully."
+                        }
+                    } catch (Exception e) {
+                        error "Failed to login to Docker registry: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'docker-registry-url', variable: 'DOCKER_REGISTRY_URL')]) {
+                        withCredentials([usernamePassword(credentialsId: 'git-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                            sh """
+                                echo "DOCKER_REGISTRY_URL is: ${DOCKER_REGISTRY_URL}"
+                                echo "DOCKER_USER is: ${DOCKER_USER}"
+                                docker tag ${IMAGE_NAME}:${BUILD_NUMBER} ${DOCKER_REGISTRY_URL}/k8s/${IMAGE_NAME}:${BUILD_NUMBER}
+                                docker push ${DOCKER_REGISTRY_URL}/k8s/${IMAGE_NAME}:${BUILD_NUMBER}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Argo-Clone Repository') {
+            steps {
+                script {
+                    try {
+                        dir('argo-repo') {
+                            sh """
+                                git init || true
+                                git remote remove origin || true
+                                git remote add origin ${env.REPO_URL_ARGO}
+                                git fetch --all --prune
+                                git checkout -f jenkins-dev
+                                git pull origin jenkins-dev
+                            """
+
+                            echo "ArgoCD repository updated successfully, and 'dev' branch is up-to-date."
+                        }
+                    } catch (Exception e) {
+                        error "Failed to pull ArgoCD repository or update \'dev\' branch: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        stage('Update API Tag Version') {
+            steps {
+                script {
+                    try {
+                        dir('argo-repo') {
+                            sh 'cat values.yaml' // Debugging: See the file content
+                            //sh 'sed -i "/ui:/s/tag: .*/tag: ${BUILD_NUMBER}/" values.yaml'
+                            //sh 'sed -i "/ui:/s/tag: .*/tag: \"${BUILD_NUMBER}\"/" values.yaml'
+                           sh 'sed -i "/ui:/,/tag:/s/tag: .*/tag: $BUILD_NUMBER/" values.yaml'
+                           sh 'sed -i "/ui:/,/repository:/s|repository: .*|repository: dpr.growatiopex.com/k8s/$IMAGE_NAME|" values.yaml'
+
+                        }
+                    } catch (Exception e) {
+                        error "Failed to update UI tag version in values.yaml: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        stage('Commit and Push Changes') {
+            steps {
+                script {
+                    try {
+                        dir('argo-repo') {
+                            sh """
+                                git config --global user.email "jenkins-ci@iopex.com"
+                                git config --global user.name "jenkins"
+                                git add -A
+                                git commit -m "Update API tag version to ${BUILD_NUMBER}" || echo "No changes to commit"
+                                git push origin jenkins-dev
+                            """
+                        }
+                        echo "Changes committed and pushed successfully."
+                    } catch (Exception e) {
+                        error "Failed to commit and push changes: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        stage('Create Merge Request') {
+            steps {
+                script {
+                    def mergeRequestUrl = ""
+                    gchat_notification("Attempting to create/find merge request for deployment...")
+                    try {
+                        withCredentials([string(credentialsId: 'gitlab-token', variable: 'GITLAB_TOKEN')]) {
+                            // Attempt to create the merge request
+                            def createResponse = sh(script: """
+                                curl -s --request POST -k \\
+                                --header "PRIVATE-TOKEN: \$GITLAB_TOKEN" \\
+                                --data "source_branch=${SOURCE_BRANCH}&target_branch=${TARGET_BRANCH}&title=${TITLE}&assignee_ids[]=${ASSIGNEE_ID}" \\
+                                https://pexgit.growipx.com/api/v4/projects/${PROJECT_ID}/merge_requests
+                            """, returnStdout: true).trim()
+
+                            echo "GitLab API create MR response: ${createResponse}"
+
+                            if (createResponse.startsWith('{') || createResponse.startsWith('[')) {
+                                def jsonResponse = readJSON text: createResponse
+                                if (jsonResponse.web_url) {
+                                    mergeRequestUrl = jsonResponse.web_url
+                                    echo "Merge request created successfully by curl: ${mergeRequestUrl}"
+                                }
+                                else if (jsonResponse.message?.toString()?.contains("Another open merge request already exists")) {
+                                    echo "Merge request already exists, trying to fetch its URL."
+                                    // Query for existing MRs between the source and target branches
+                                    def listResponse = sh(script: """
+                                        curl -s --request GET -k \\
+                                        --header "PRIVATE-TOKEN: \$GITLAB_TOKEN" \\
+                                        "https://pexgit.growipx.com/api/v4/projects/${PROJECT_ID}/merge_requests?state=opened&source_branch=${SOURCE_BRANCH}&target_branch=${TARGET_BRANCH}"
+                                    """, returnStdout: true).trim()
+
+                                    if (listResponse.startsWith('[')) {
+                                        def mrs = readJSON text: listResponse
+                                        if (mrs && mrs.size() > 0 && mrs[0].web_url) {
+                                            mergeRequestUrl = mrs[0].web_url
+                                            echo "Found existing Merge Request URL: ${mergeRequestUrl}"
+                                        } else {
+                                            echo "Could not find existing merge request URL despite 'already exists' message."
+                                            mergeRequestUrl = "Existing MR found, but URL not available."
+                                        }
+                                    } else {
+                                        echo "Failed to parse list merge requests response: ${listResponse}"
+                                        mergeRequestUrl = "Failed to get existing MR URL from API."
+                                    }
+                                } else {
+                                    // This block will now correctly capture other, genuinely unexpected errors.
+                                    error "Failed to create merge request: Unexpected JSON response or error message: ${jsonResponse}"
+                                }
+                            } else {
+                                error "Failed to create merge request: Non-JSON or empty response from curl: ${createResponse}"
+                            }
+                        }
+
+                        // Send notification with the determined MR URL
+                        gchat_notification("Stage: Create Merge Request - Success - Merge Request URL: ${mergeRequestUrl} - Job URL: ${env.BUILD_URL} - Build Number: ${env.BUILD_NUMBER}")
+                    } catch (Exception e) {
+                        error "Failed to create merge request: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def buildStatus = currentBuild.currentResult ?: 'SUCCESS'
+                gchat_notification("Pipeline finished with status: ${buildStatus} - Job URL: ${env.BUILD_URL}", null, buildStatus)
+            }
+        }
+        failure {
+            script {
+                gchat_notification("Pipeline failed! - Job URL: ${env.BUILD_URL}", null, 'FAILURE')
+            }
+        }
+        success {
+            script {
+                gchat_notification("Pipeline succeeded! - Job URL: ${env.BUILD_URL}", null, 'SUCCESS')
+            }
+        }
+    }
+}
+
+def gchat_notification(msg, thread_id=null, build_status=null) {
+    withCredentials([string(credentialsId: 'iconnect-qa', variable: 'GCHAT_API_TOKEN')]) {
+        def command = "/opt/venv/bin/python /var/lib/jenkins/scripts/notification.py"
+        def args = [
+            "-s ${GSPACE_ID}",
+            "-m \"${msg}\"",
+            "-t \"\$GCHAT_API_TOKEN\""
+        ]
+
+        if (thread_id) {
+            args << "-T ${thread_id}"
+        }
+        if (build_status) {
+            args << "-S ${build_status}"
+        }
+
+        sh "set +x && ${command} ${args.join(' ')}"
+    }
+}
